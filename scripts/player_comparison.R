@@ -4,6 +4,7 @@
 #   1. Bunched goals (2+ goals in same game vs spread across games)
 #   2. Goals vs end-of-season table position groups
 #   3. Decisive goals (last goal that changed points outcome and wasn't cancelled)
+#   4. xG quality buckets — shots and goals by xG band
 
 library(pacman)
 p_load(dplyr, purrr, arrow, here, stringr)
@@ -17,13 +18,15 @@ LEAGUE  <- "serie_a"
 VLAHOVIC_SEASONS <- c(2021, 2022, 2023, 2024, 2025)
 HIGUAIN_SEASONS  <- c(2016, 2017, 2019)
 
-group_order <- c(
+GROUP_ORDER <- c(
   "Champions League (1-4)",
   "Europa League (5-6)",
   "Top Half Midtable (7-10)",
   "Bottom Half Midtable (11-17)",
   "Relegation Zone (18-20)"
 )
+
+XG_BUCKET_ORDER <- c("<= 0.10", "0.10 - 0.25", "0.25 - 0.40", "> 0.40")
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -62,6 +65,17 @@ group_label <- function(pos) {
     pos <= 10 ~ "Top Half Midtable (7-10)",
     pos <= 17 ~ "Bottom Half Midtable (11-17)",
     TRUE      ~ "Relegation Zone (18-20)"
+  )
+}
+
+#' xG quality bucket label
+#' @param xg Numeric xG value
+xg_bucket_label <- function(xg) {
+  case_when(
+    xg <= 0.10              ~ "<= 0.10",
+    xg > 0.10 & xg <= 0.25 ~ "0.10 - 0.25",
+    xg > 0.25 & xg <= 0.40 ~ "0.25 - 0.40",
+    xg > 0.40               ~ "> 0.40"
   )
 }
 
@@ -105,7 +119,10 @@ filter_player_juve <- function(shots, player) {
     mutate(
       xG       = as.numeric(xG),
       is_goal  = result == "Goal",
-      opp_team = case_when(side == "h" ~ a_team, TRUE ~ h_team)
+      opp_team = case_when(
+        side == "h" ~ a_team,
+        TRUE        ~ h_team
+      )
     )
 }
 
@@ -116,11 +133,11 @@ filter_player_juve <- function(shots, player) {
 #' @param player_shots Filtered shot data for one player
 compute_bunched_goals <- function(player_shots) {
   goals_only <- player_shots |> filter(is_goal)
-  
+
   per_match <- goals_only |>
     group_by(match_id) |>
     summarise(goals_in_match = n(), .groups = "drop")
-  
+
   total_games   <- n_distinct(player_shots$match_id)
   scoring_games <- nrow(per_match)
   bunched_games <- sum(per_match$goals_in_match >= 2)
@@ -128,7 +145,7 @@ compute_bunched_goals <- function(player_shots) {
   total_goals   <- sum(per_match$goals_in_match)
   bunched_goals <- sum(per_match$goals_in_match[per_match$goals_in_match >= 2])
   spread_goals  <- sum(per_match$goals_in_match[per_match$goals_in_match == 1])
-  
+
   tibble(
     total_games       = total_games,
     scoring_games     = scoring_games,
@@ -155,7 +172,7 @@ load_final_standings <- function(season) {
     print(paste("No matchday history for season", season))
     return(NULL)
   }
-  
+
   read_parquet(path) |>
     filter(league == "Serie_A") |>
     group_by(team) |>
@@ -178,29 +195,29 @@ compute_goals_by_group <- function(player_shots, seasons) {
     st <- load_final_standings(s)
     if (!is.null(st)) mutate(st, season = s)
   })
-  
+
   if (nrow(standings) == 0) return(NULL)
-  
+
   goals_only <- player_shots |>
     filter(is_goal) |>
     left_join(standings, by = c("opp_team" = "team", "season"))
-  
+
   games_vs_group <- player_shots |>
     left_join(standings, by = c("opp_team" = "team", "season")) |>
     filter(!is.na(opp_group)) |>
     distinct(match_id, opp_group) |>
     count(opp_group, name = "games_vs_group")
-  
+
   total_games <- n_distinct(player_shots$match_id)
   total_goals <- sum(player_shots$is_goal)
-  
+
   goals_only |>
     filter(!is.na(opp_group)) |>
     group_by(opp_group) |>
     summarise(goals = n(), .groups = "drop") |>
     left_join(games_vs_group, by = "opp_group") |>
     mutate(
-      opp_group         = factor(opp_group, levels = group_order),
+      opp_group         = factor(opp_group, levels = GROUP_ORDER),
       pct_of_goals      = round(goals / total_goals * 100, 1),
       pct_of_games      = round(games_vs_group / total_games * 100, 1),
       goals_per_game    = round(goals / games_vs_group, 3),
@@ -220,7 +237,7 @@ compute_goals_by_group <- function(player_shots, seasons) {
 #' @param juve_side   "h" or "a" — which side Juventus are on
 classify_decisive <- function(match_goals, player, juve_side) {
   if (nrow(match_goals) == 0) return(tibble())
-  
+
   match_goals <- match_goals |>
     arrange(parse_minute(minute)) |>
     mutate(
@@ -228,29 +245,25 @@ classify_decisive <- function(match_goals, player, juve_side) {
       juve_cum    = cumsum(juve_scored),
       opp_cum     = cumsum(!juve_scored),
       pts_after   = pts_state(juve_cum, opp_cum),
-      pts_before  = lag(pts_after, default = 1L)  # game starts at draw
+      pts_before  = lag(pts_after, default = 1L)
     )
-  
+
   n <- nrow(match_goals)
-  
+
   map_dfr(seq_len(n), function(i) {
     row <- match_goals[i, ]
-    
-    # Only consider goals by our player for Juventus
+
     if (!row$juve_scored || row$player != player) return(NULL)
-    
-    # Did this goal change the points state upward?
     if (row$pts_after <= row$pts_before) return(NULL)
-    
+
     pts_level <- row$pts_after
-    
-    # Check all subsequent events — did pts ever drop below pts_level?
+
     cancelled <- if (i < n) {
       any(match_goals$pts_after[(i + 1):n] < pts_level)
     } else {
       FALSE
     }
-    
+
     tibble(
       match_id   = row$match_id,
       player     = row$player,
@@ -269,18 +282,18 @@ compute_decisive_goals <- function(player_shots, all_shots) {
   player    <- unique(player_shots$player)
   match_ids <- unique(player_shots$match_id[player_shots$is_goal])
   juve_side <- player_shots |> distinct(match_id, side)
-  
+
   if (length(match_ids) == 0) return(tibble())
-  
+
   map_dfr(match_ids, function(mid) {
     js <- juve_side$side[juve_side$match_id == mid]
     if (length(js) == 0) return(NULL)
-    
+
     match_goals <- all_shots |>
       filter(match_id == mid, result == "Goal")
-    
+
     if (nrow(match_goals) == 0) return(NULL)
-    
+
     classify_decisive(match_goals, player, js)
   })
 }
@@ -293,7 +306,7 @@ summarise_decisive <- function(player_shots, decisive_df) {
   total_goals    <- sum(player_shots$is_goal)
   decisive_goals <- sum(decisive_df$decisive, na.rm = TRUE)
   decisive_games <- n_distinct(decisive_df$match_id[decisive_df$decisive])
-  
+
   tibble(
     total_games        = total_games,
     total_goals        = total_goals,
@@ -303,6 +316,26 @@ summarise_decisive <- function(player_shots, decisive_df) {
     pct_games_decisive = round(decisive_games / total_games * 100, 1),
     decisive_per_game  = round(decisive_goals / total_games, 3)
   )
+}
+
+# ── 4. xG quality buckets ──────────────────────────────────────────────────────
+
+#' Compute shots and goals by xG quality bucket for a player
+#' Penalties excluded
+#' @param player_shots Filtered shot data for one player
+compute_xg_buckets <- function(player_shots) {
+  player_shots |>
+    filter(situation != "Penalty") |>
+    mutate(bucket = factor(xg_bucket_label(xG), levels = XG_BUCKET_ORDER)) |>
+    group_by(bucket) |>
+    summarise(
+      shots      = n(),
+      goals      = sum(is_goal),
+      conversion = round(goals / shots * 100, 1),
+      avg_xg     = round(mean(xG), 3),
+      .groups    = "drop"
+    ) |>
+    arrange(bucket)
 }
 
 # ── Run analysis ───────────────────────────────────────────────────────────────
@@ -324,9 +357,10 @@ print("Computing bunched goals...")
 bunched_comparison <- bind_rows(
   compute_bunched_goals(vlahovic) |> mutate(player = "Dusan Vlahovic"),
   compute_bunched_goals(higuain)  |> mutate(player = "Gonzalo Higuaín")
-) |> select(player, everything())
+) |>
+  select(player, everything())
 
-print("── Bunched Goals ──")
+print("Bunched Goals:")
 print(bunched_comparison)
 
 # ── 2. Goals by table group ────────────────────────────────────────────────────
@@ -335,10 +369,11 @@ print("Computing goals by table group...")
 group_comparison <- bind_rows(
   compute_goals_by_group(vlahovic, VLAHOVIC_SEASONS) |> mutate(player = "Dusan Vlahovic"),
   compute_goals_by_group(higuain,  HIGUAIN_SEASONS)  |> mutate(player = "Gonzalo Higuaín")
-) |> select(player, opp_group, goals, games_vs_group,
-            pct_of_goals, pct_of_games, goals_per_game, goals_games_ratio)
+) |>
+  select(player, opp_group, goals, games_vs_group,
+         pct_of_goals, pct_of_games, goals_per_game, goals_games_ratio)
 
-print("── Goals by Table Group ──")
+print("Goals by Table Group:")
 print(group_comparison)
 
 # ── 3. Decisive goals ──────────────────────────────────────────────────────────
@@ -350,10 +385,24 @@ decisive_h <- compute_decisive_goals(higuain,  all_shots_h)
 decisive_comparison <- bind_rows(
   summarise_decisive(vlahovic, decisive_v) |> mutate(player = "Dusan Vlahovic"),
   summarise_decisive(higuain,  decisive_h) |> mutate(player = "Gonzalo Higuaín")
-) |> select(player, everything())
+) |>
+  select(player, everything())
 
-print("── Decisive Goals ──")
+print("Decisive Goals:")
 print(decisive_comparison)
+
+# ── 4. xG quality buckets ──────────────────────────────────────────────────────
+
+print("Computing xG quality buckets...")
+xg_buckets <- bind_rows(
+  compute_xg_buckets(vlahovic) |> mutate(player = "Dusan Vlahovic"),
+  compute_xg_buckets(higuain)  |> mutate(player = "Gonzalo Higuaín")
+) |>
+  select(player, everything()) |>
+  arrange(player, bucket)
+
+print("xG Quality Buckets:")
+print(xg_buckets, n = Inf)
 
 # ── Save ───────────────────────────────────────────────────────────────────────
 
@@ -362,6 +411,7 @@ dir.create(here("Data_Player"), showWarnings = FALSE)
 write_parquet(bunched_comparison,  here("Data_Player", "comparison_bunched.parquet"))
 write_parquet(group_comparison,    here("Data_Player", "comparison_by_group.parquet"))
 write_parquet(decisive_comparison, here("Data_Player", "comparison_decisive.parquet"))
+write_parquet(xg_buckets,          here("Data_Player", "comparison_xg_buckets.parquet"))
 
 write_parquet(
   bind_rows(
