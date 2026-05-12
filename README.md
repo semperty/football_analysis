@@ -16,7 +16,9 @@ Current data sources include:
 
 ### Project Structure
 `/scripts`: R scripts for web scraping and data tidying
+
 `/data`: Local storage for Parquet files (match stats and financial records)
+
 `README.md`: Project documentation
 
 ### Future Goals
